@@ -15,16 +15,16 @@ bool hubbleadv(uint8_t p_data[13], size_t p_size) {
 
     size_t adv_len = sizeof(adv_data);
 
-    Serial.printf("sizeof(h_data)=%u\n", sizeof(h_data));
-
     ret = hubble_ble_advertise_get(p_data, p_size, adv_data, &adv_len);
+
+    //debug
+    /*
+    Serial.printf("sizeof(p_data)=%u\n", sizeof(p_data));
 
     Serial.printf("hubble_advertise=%d\r\n", ret);
     Serial.printf("adv_len=%u\r\n", (unsigned)adv_len);
     Serial.println();
 
-    //debug
-    /*
     for (size_t i = 0; i < adv_len; i++) {
       Serial.printf("%02X ", adv_data[i]);
     }
