@@ -1,4 +1,4 @@
-bool hubbleadv(uint8_t sensor_data[13]) {
+bool hubbleadv(uint8_t p_data[13], size_t p_size) {
   bool res = false;
 
   decodeKey(HUBBLE_KEY, key256);
@@ -17,7 +17,7 @@ bool hubbleadv(uint8_t sensor_data[13]) {
 
     Serial.printf("sizeof(h_data)=%u\n", sizeof(h_data));
 
-    ret = hubble_ble_advertise_get(h_data, sizeof(h_data), adv_data, &adv_len);
+    ret = hubble_ble_advertise_get(p_data, p_size, adv_data, &adv_len);
 
     Serial.printf("hubble_advertise=%d\r\n", ret);
     Serial.printf("adv_len=%u\r\n", (unsigned)adv_len);
