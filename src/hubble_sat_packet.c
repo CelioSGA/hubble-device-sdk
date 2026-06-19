@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 
+#include <hubble/hubble.h>
 #include <hubble/sat/packet.h>
 #include <hubble/port/sat_radio.h>
 #include <hubble/port/sys.h>
@@ -106,7 +107,12 @@ static int _encode(const struct hubble_bitarray *bit_array, int *symbols,
 	int symbol_bit_index = 0;
 	int index = 0;
 
-	if ((bit_array->index / HUBBLE_SYMBOL_SIZE) > symbols_size) {
+	/**
+	 * Account for the trailing padding symbol written when the bit count is
+	 * not a multiple of HUBBLE_SYMBOL_SIZE.
+	 */
+	if (((bit_array->index + HUBBLE_SYMBOL_SIZE - 1) / HUBBLE_SYMBOL_SIZE) >
+	    symbols_size) {
 		return -EINVAL;
 	}
 
@@ -253,12 +259,25 @@ int hubble_sat_packet_get(struct hubble_sat_packet *packet, const void *payload,
 	uint8_t auth_tag[HUBBLE_AUTH_TAG_SIZE / HUBBLE_BITS_PER_BYTE];
 	uint8_t out[HUBBLE_PAYLOAD_MAX_SIZE] = {0};
 	uint16_t seq_no;
-	uint32_t time_counter = hubble_internal_time_counter_get();
+	uint32_t time_counter;
 	uint32_t eid;
+
+	if ((packet == NULL) || ((payload == NULL) && (length > 0))) {
+		return -EINVAL;
+	}
 
 	if (hubble_internal_key_get() == NULL) {
 		HUBBLE_LOG_WARNING("Key not set");
 		return -EINVAL;
+	}
+
+	/* Use the configured counter source (Unix time or device uptime) so
+	 * satellite packets honor CONFIG_HUBBLE_COUNTER_SOURCE_DEVICE_UPTIME,
+	 * matching the BLE advertisement path.
+	 */
+	ret = hubble_counter_get(&time_counter);
+	if (ret != 0) {
+		return ret;
 	}
 
 	ret = hubble_internal_sequence_acquire(time_counter, &seq_no);
@@ -352,6 +371,10 @@ int hubble_sat_packet_frames_get(const struct hubble_sat_packet *packet,
 #define _CHECK_RET(_ret)                                                       \
 	if (_ret < 0) {                                                        \
 		return _ret;                                                   \
+	}
+
+	if ((packet == NULL) || (frames == NULL)) {
+		return -EINVAL;
 	}
 
 	/* Validate the packet length (which maps to the PHY payload size field)

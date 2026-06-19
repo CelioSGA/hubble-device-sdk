@@ -10,6 +10,7 @@
 #include <zephyr/arch/arm/irq.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/types.h>
+#include <zephyr/version.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 
@@ -37,6 +38,12 @@
 #define RADIO_ENABLE_TX_ON_CC0_PPI 9U
 #define RADIO_DISABLE_ON_CC1_PPI   12U
 
+#if ZEPHYR_VERSION_CODE >= ZEPHYR_VERSION(4, 4, 0)
+static nrfx_timer_t _timer0 = NRFX_TIMER_INSTANCE(NRF_TIMER_INST_GET(10));
+#else
+static nrfx_timer_t _timer0 = NRFX_TIMER_INSTANCE(10);
+#endif
+
 /**
  * Signature for APIs provided by the binary library.
  */
@@ -46,11 +53,9 @@ int hubble_nrf_lib_disable(void);
 
 static const struct device *const clock0 = DEVICE_DT_GET_ONE(nordic_nrf_clock);
 
-static nrfx_timer_t _timer0 = NRFX_TIMER_INSTANCE(NRF_TIMER_INST_GET(10));
-
 /* Keep track of power before and in sat tx mode */
 static nrf_radio_txpower_t _normal_power = RADIO_TXPOWER_TXPOWER_0dBm;
-static nrf_radio_txpower_t _sat_power = RADIO_TXPOWER_TXPOWER_0dBm;
+nrf_radio_txpower_t _sat_power = RADIO_TXPOWER_TXPOWER_0dBm;
 
 /**
  * This semaphore is used to protect a packet transmission and avoid
@@ -140,6 +145,66 @@ static void _timer_setup(void)
 	nrfx_timer_init(&_timer0, &timer_cfg, NULL);
 }
 
+/**
+ * Tear down any radio/timer wiring left behind by the BLE controller.
+ *
+ * The BLE controller drives the radio entirely through DPPI: it leaves the
+ * RADIO connected to DPPIC channels via its SUBSCRIBE and PUBLISH registers,
+ * keeps those DPPIC channels enabled, may leave the radio in a non-DISABLED
+ * state, and leaves stale shorts/config behind.
+ */
+static void _radio_reset(void)
+{
+	const nrf_radio_task_t tasks[] = {
+		NRF_RADIO_TASK_TXEN,    NRF_RADIO_TASK_RXEN,
+		NRF_RADIO_TASK_START,   NRF_RADIO_TASK_STOP,
+		NRF_RADIO_TASK_DISABLE,
+	};
+	const nrf_radio_event_t events[] = {
+		NRF_RADIO_EVENT_READY,    NRF_RADIO_EVENT_ADDRESS,
+		NRF_RADIO_EVENT_PAYLOAD,  NRF_RADIO_EVENT_END,
+		NRF_RADIO_EVENT_DISABLED, NRF_RADIO_EVENT_TXREADY,
+	};
+
+	/* Stop interrupts and automatic state transitions first. */
+	nrf_radio_int_disable(NRF_RADIO, ~0U);
+	nrf_radio_shorts_set(NRF_RADIO, 0);
+
+	/* Force the radio to DISABLED (required before SOFTRESET and before we
+	 * reconfigure it).
+	 */
+	if (nrf_radio_state_get(NRF_RADIO) != NRF_RADIO_STATE_DISABLED) {
+		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
+		nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
+		while (!nrf_radio_event_check(NRF_RADIO,
+					      NRF_RADIO_EVENT_DISABLED)) {
+		}
+		nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
+	}
+
+	/* Detach the radio from every DPPI channel it might still be wired to. */
+	for (size_t i = 0; i < ARRAY_SIZE(tasks); i++) {
+		nrf_radio_subscribe_clear(NRF_RADIO, tasks[i]);
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(events); i++) {
+		nrf_radio_publish_clear(NRF_RADIO, events[i]);
+	}
+
+#if defined(RADIO_TASKS_SOFTRESET_TASKS_SOFTRESET_Msk)
+	/* Clear leftover public config (PCNF/MODECNF/frequency/...). */
+	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_SOFTRESET);
+#endif
+
+	/* Stop and detach our timer, dropping any compare events the previous
+	 * owner published onto DPPI.
+	 */
+	nrf_timer_task_trigger(_timer0.p_reg, NRF_TIMER_TASK_STOP);
+	nrf_timer_int_disable(_timer0.p_reg, ~0U);
+	nrf_timer_shorts_set(_timer0.p_reg, 0);
+	nrf_timer_publish_clear(_timer0.p_reg, NRF_TIMER_EVENT_COMPARE0);
+	nrf_timer_publish_clear(_timer0.p_reg, NRF_TIMER_EVENT_COMPARE1);
+}
+
 static void _radio_isr(const void *arg)
 {
 	if (nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_DISABLED)) {
@@ -182,9 +247,10 @@ int hubble_sat_soc_enable(void)
 		return ret;
 	}
 
-	(void)hubble_nrf_lib_enable();
+	/* Wipe out any radio/timer/DPPI state left behind by the BLE controller */
+	_radio_reset();
 
-	NRF_RADIO->SUBSCRIBE_RXEN = 0;
+	(void)hubble_nrf_lib_enable();
 
 	nrf_radio_fast_ramp_up_enable_set(NRF_RADIO, true);
 	nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_BLE_1MBIT);
@@ -243,118 +309,3 @@ int hubble_sat_soc_packet_send(const struct hubble_sat_packet_frames *packet)
 
 	return 0;
 }
-
-#ifdef CONFIG_HUBBLE_SAT_NETWORK_DTM_MODE
-
-int hubble_sat_soc_power_set(int8_t power)
-{
-	switch (power) {
-	case 8:
-		_sat_power = NRF_RADIO_TXPOWER_POS8DBM;
-		break;
-	case 7:
-		_sat_power = NRF_RADIO_TXPOWER_POS7DBM;
-		break;
-	case 6:
-		_sat_power = NRF_RADIO_TXPOWER_POS6DBM;
-		break;
-	case 5:
-		_sat_power = NRF_RADIO_TXPOWER_POS5DBM;
-		break;
-	case 4:
-		_sat_power = NRF_RADIO_TXPOWER_POS4DBM;
-		break;
-	case 3:
-		_sat_power = NRF_RADIO_TXPOWER_POS3DBM;
-		break;
-	case 2:
-		_sat_power = NRF_RADIO_TXPOWER_POS2DBM;
-		break;
-	case 1:
-		_sat_power = NRF_RADIO_TXPOWER_POS1DBM;
-		break;
-	case 0:
-		_sat_power = NRF_RADIO_TXPOWER_0DBM;
-		break;
-	case -1:
-		_sat_power = NRF_RADIO_TXPOWER_NEG1DBM;
-		break;
-	case -2:
-		_sat_power = NRF_RADIO_TXPOWER_NEG2DBM;
-		break;
-	case -3:
-		_sat_power = NRF_RADIO_TXPOWER_NEG3DBM;
-		break;
-	case -4:
-		_sat_power = NRF_RADIO_TXPOWER_NEG4DBM;
-		break;
-	case -5:
-		_sat_power = NRF_RADIO_TXPOWER_NEG5DBM;
-		break;
-	case -6:
-		_sat_power = NRF_RADIO_TXPOWER_NEG6DBM;
-		break;
-	case -7:
-		_sat_power = NRF_RADIO_TXPOWER_NEG7DBM;
-		break;
-	case -8:
-		_sat_power = NRF_RADIO_TXPOWER_NEG8DBM;
-		break;
-	case -9:
-		_sat_power = NRF_RADIO_TXPOWER_NEG9DBM;
-		break;
-	case -10:
-		_sat_power = NRF_RADIO_TXPOWER_NEG10DBM;
-		break;
-	case -12:
-		_sat_power = NRF_RADIO_TXPOWER_NEG12DBM;
-		break;
-	case -14:
-		_sat_power = NRF_RADIO_TXPOWER_NEG14DBM;
-		break;
-	case -16:
-		_sat_power = NRF_RADIO_TXPOWER_NEG16DBM;
-		break;
-	case -20:
-		_sat_power = NRF_RADIO_TXPOWER_NEG20DBM;
-		break;
-	case -40:
-		_sat_power = NRF_RADIO_TXPOWER_NEG40DBM;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	nrf_radio_txpower_set(NRF_RADIO, _sat_power);
-	return 0;
-}
-
-int hubble_sat_soc_cw_start(uint8_t channel)
-{
-	int ret = hubble_nrf_lib_frequency_set(channel, 32);
-
-	if (ret != 0) {
-		return ret;
-	}
-
-	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_TXEN);
-	while (!nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_TXREADY)) {
-		/* Do nothing */
-	}
-
-	return 0;
-}
-
-int hubble_sat_soc_cw_stop(void)
-{
-	nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
-
-	while (!nrf_radio_event_check(NRF_RADIO, NRF_RADIO_EVENT_DISABLED)) {
-		/* Do nothing */
-	}
-	nrf_radio_event_clear(NRF_RADIO, NRF_RADIO_EVENT_DISABLED);
-
-	return 0;
-}
-
-#endif /* CONFIG_HUBBLE_SAT_NETWORK_DTM_MODE */
